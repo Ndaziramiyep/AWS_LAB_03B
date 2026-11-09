@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"                     # CloudFormation template format version
+Description: >-                                             # Shown in the CloudFormation console
+  Onward Logistics - 00 bootstrap. The single stack that cannot deploy itself through
+  GitSync, because it creates the role GitSync uses. Deployed ONCE with the AWS CLI
+  (see README "Rebuild from scratch"). Creates the GitSync / CloudFormation role and,
+  optionally, the CodeConnections GitHub connection. No inline policies.
+
+Parameters:                                                 # Inputs supplied at deploy time
+  ResourcePrefix:                                           # Company naming prefix
+    Type: String                                            # Plain text value
+    Default: onward-orders-lab                              # <project>-<environment>
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"                # Lowercase, short, DNS-safe
+    Description: Naming prefix <project>-<environment> applied to every resource.
+  ExistingConnectionArn:                                    # Reuse a connection that is already authorised
+    Type: String                                            # Plain text value
+    Default: ""                                             # Empty = create a new connection
+    Description: >-
+      ARN of an existing AVAILABLE CodeConnections GitHub connection. Leave empty to create a
+      new one (it starts PENDING and needs the one-time GitHub authorization in the console).
+
+Conditions:                                                 # True/false switches used below
+  CreateConnection: !Equals [!Ref ExistingConnectionArn, ""]  # True when no connection was given
+
+Resources:                                                  # Everything this stack creates
+  GitHubConnection:                                         # Link between AWS and GitHub
+    Type: AWS::CodeConnections::Connection                  # CodeConnections resource type
+    Condition: CreateConnection                             # Only if no existing ARN was passed
+    Properties:                                             # Settings of the connection
+      ConnectionName: !Sub ${ResourcePrefix}-github         # Follows the naming standard
+      ProviderType: GitHub                                  # Source provider
+
+  GitSyncPolicy:                                            # What GitSync itself needs (from AWS docs)
+    Type: AWS::IAM::ManagedPolicy                           # Customer-managed, never inline
+    Properties:                                             # Policy settings
+      ManagedPolicyName: !Sub ${ResourcePrefix}-gitsync-sync-policy  # Policy name
+      Description: Lets CloudFormation GitSync create change sets and manage its EventBridge rules.
+      PolicyDocument:                                       # The permissions
+        Version: "2012-10-17"                               # IAM policy language version
+        Statement:                                          # List of permission statements
+          - Sid: SyncToCloudFormation                       # Create and run change sets
+            Effect: Allow                                   # Grant
+            Action:                                         # CloudFormation actions GitSync calls
+              - cloudformation:CreateChangeSet              # Build a change set from Git
+              - cloudformation:DeleteChangeSet              # Clean up old change sets
+              - cloudformation:DescribeChangeSet            # Read change set status
+              - cloudformation:DescribeStackEvents          # Read deployment events
+              - cloudformation:DescribeStacks               # Read stack status
+              - cloudformation:ExecuteChangeSet             # Apply the change set
+              - cloudformation:GetTemplate                  # Compare current template
+              - cloudformation:ListChangeSets               # List pending change sets
+              - cloudformation:ListStacks                   # Find the stack
+              - cloudformation:ValidateTemplate             # Validate the template
+            Resource: "*"                                   # Change sets have no fixed ARN up front
+          - Sid: PolicyForManagedRules                      # GitSync uses EventBridge rules
+            Effect: Allow                                   # Grant
+            Action:                                         # Rule management actions
+              - events:PutRule                              # Create/update its rule
+              - events:PutTargets                           # Point the rule at GitSync
+            Resource: "*"                                   # Limited by the condition below
+            Condition:                                      # Only rules GitSync owns
+              StringEquals:                                 # Exact match
+                events:ManagedBy:                           # Rule owner attribute
+                  - cloudformation.sync.codeconnections.amazonaws.com  # GitSync service
+          - Sid: PolicyForDescribingRule                    # Read rule status
+            Effect: Allow                                   # Grant
+            Action: events:DescribeRule                     # Read-only call
+            Resource: "*"                                   # Any rule (read-only)
+
+  StackDeployPolicy:                                        # What CloudFormation needs to build stacks 01-06
+    Type: AWS::IAM::ManagedPolicy                           # Customer-managed, never inline
+    Properties:                                             # Policy settings
+      ManagedPolicyName: !Sub ${ResourcePrefix}-gitsync-deploy-policy  # Policy name
+      Description: Resource permissions for the Onward Orders stacks deployed through GitSync.
+      PolicyDocument:                                       # The permissions
+        Version: "2012-10-17"                               # IAM policy language version
+        Statement:                                          # List of permission statements
+          - Sid: ServicesUsedByStacks                       # Services the templates create
+            Effect: Allow                                   # Grant
+            Action:                                         # One line per service
+              - ec2:*                                       # VPC, subnets, SGs, endpoints
+              - elasticloadbalancing:*                      # ALB, listeners, target groups
+              - ecs:*                                       # Cluster, task definition, service
+              - ecr:*                                       # Image repository
+              - logs:*                                      # Log group
+              - cloudwatch:*                                # Rollback alarms
+              - application-autoscaling:*                   # Scaling target and policies
+              - codedeploy:*                                # Blue/green application and group
+              - codepipeline:*                              # Release pipeline
+              - events:*                                    # ECR push rule
+              - ssm:GetParameter                            # Read SSM parameters (optional use)
+              - ssm:GetParameters                           # Read several parameters
+              - ssm:PutParameter                            # Write parameters
+              - ssm:DeleteParameter                         # Delete parameters
+              - ssm:AddTagsToResource                       # Tag parameters
+              - ssm:RemoveTagsFromResource                  # Untag parameters
+              - ssm:ListTagsForResource                     # Read parameter tags
+            Resource: "*"                                   # Resource ARNs are not known before creation
+          - Sid: ArtifactBucket                             # Only buckets with our prefix
+            Effect: Allow                                   # Grant
+            Action: s3:*                                    # Create and configure the bucket
+            Resource:                                       # Scoped to our prefix
+              - !Sub arn:${AWS::Partition}:s3:::${ResourcePrefix}-*    # The bucket
+              - !Sub arn:${AWS::Partition}:s3:::${ResourcePrefix}-*/*  # Objects in it
+          - Sid: IamScopedToPrefix                          # IAM writes only on our own names
+            Effect: Allow                                   # Grant
+            Action:                                         # Role and managed policy lifecycle
+              - iam:CreateRole                              # Create roles
+              - iam:DeleteRole                              # Delete roles
+              - iam:GetRole                                 # Read roles
+              - iam:UpdateRole                              # Change role settings
+              - iam:UpdateAssumeRolePolicy                  # Change trust policies
+              - iam:TagRole                                 # Tag roles
+              - iam:UntagRole                               # Untag roles
+              - iam:AttachRolePolicy                        # Attach managed policies
+              - iam:DetachRolePolicy                        # Detach managed policies
+              - iam:ListAttachedRolePolicies                # List attached policies
+              - iam:ListRolePolicies                        # Needed by CFN to confirm no inline policies
+              - iam:PassRole                                # Hand roles to ECS/CodeDeploy/etc.
+              - iam:CreatePolicy                            # Create managed policies
+              - iam:DeletePolicy                            # Delete managed policies
+              - iam:GetPolicy                               # Read managed policies
+              - iam:GetPolicyVersion                        # Read policy versions
+              - iam:ListPolicyVersions                      # List policy versions
+              - iam:CreatePolicyVersion                     # Update a managed policy
+              - iam:DeletePolicyVersion                     # Remove old versions
+              - iam:TagPolicy                               # Tag policies
+              - iam:UntagPolicy                             # Untag policies
+            Resource:                                       # Only names starting with the prefix
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ResourcePrefix}-*    # Our roles
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${ResourcePrefix}-*  # Our policies
+          - Sid: GitHubOidcProvider                         # Manage the GitHub OIDC provider only
+            Effect: Allow                                   # Grant
+            Action:                                         # OIDC provider lifecycle
+              - iam:CreateOpenIDConnectProvider             # Create it
+              - iam:DeleteOpenIDConnectProvider             # Delete it
+              - iam:GetOpenIDConnectProvider                # Read it
+              - iam:UpdateOpenIDConnectProviderThumbprint   # Update thumbprints
+              - iam:AddClientIDToOpenIDConnectProvider      # Add audience
+              - iam:RemoveClientIDFromOpenIDConnectProvider # Remove audience
+              - iam:TagOpenIDConnectProvider                # Tag it
+              - iam:UntagOpenIDConnectProvider              # Untag it
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com  # GitHub only
+          - Sid: ServiceLinkedRoles                         # AWS-owned roles some services need
+            Effect: Allow                                   # Grant
+            Action: iam:CreateServiceLinkedRole             # Create on first use
+            Resource: "*"                                   # Limited by the condition below
+            Condition:                                      # Only these services
+              StringLike:                                   # Pattern match
+                iam:AWSServiceName:                         # Service that owns the role
+                  - ecs.amazonaws.com                       # ECS
+                  - ecs.application-autoscaling.amazonaws.com  # ECS auto scaling
+                  - elasticloadbalancing.amazonaws.com      # ALB
+          - Sid: UseGitHubConnection                        # Pipeline source uses the connection
+            Effect: Allow                                   # Grant
+            Action:                                         # Connection actions (new and old namespace)
+              - codeconnections:PassConnection              # Give connection to CodePipeline
+              - codeconnections:UseConnection               # Use the connection
+              - codestar-connections:PassConnection         # Legacy namespace
+              - codestar-connections:UseConnection          # Legacy namespace
+            Resource: "*"                                   # Connection ARN is a parameter
+
+  GitSyncRole:                                              # One role: GitSync sync role + stack role
+    Type: AWS::IAM::Role                                    # IAM role
+    Properties:                                             # Role settings
+      RoleName: !Sub ${ResourcePrefix}-gitsync-role         # Fixed name, easy to select in console
+      Description: Assumed by CloudFormation GitSync to sync and deploy the Onward Orders stacks.
+      AssumeRolePolicyDocument:                             # Trust policy (who can assume), not inline
+        Version: "2012-10-17"                               # IAM policy language version
+        Statement:                                          # Trust statements
+          - Effect: Allow                                   # Allow assume
+            Principal:                                      # Who
+              Service:                                      # AWS services
+                - cloudformation.sync.codeconnections.amazonaws.com  # GitSync
+                - cloudformation.amazonaws.com              # CloudFormation stack operations
+            Action: sts:AssumeRole                          # Assume the role
+            Condition:                                      # Confused-deputy protection
+              StringEquals:                                 # Exact match
+                aws:SourceAccount: !Ref AWS::AccountId      # Only from this account
+      ManagedPolicyArns:                                    # Managed policies (no inline "Policies:")
+        - !Ref GitSyncPolicy                                # Sync permissions
+        - !Ref StackDeployPolicy                            # Resource permissions
+
+Outputs:                                                    # Values other stacks / humans need
+  GitSyncRoleArn:                                           # Role ARN
+    Description: Role to select when creating each GitSync stack.
+    Value: !GetAtt GitSyncRole.Arn                          # Role ARN value
+    Export:                                                 # Share across stacks
+      Name: !Sub ${ResourcePrefix}-gitsync-role-arn         # Export name
+  ConnectionArn:                                            # Connection used by GitSync and pipeline
+    Description: CodeConnections GitHub connection used by GitSync and CodePipeline.
+    Value: !If [CreateConnection, !GetAtt GitHubConnection.ConnectionArn, !Ref ExistingConnectionArn]  # New or reused
+    Export:                                                 # Share across stacks
+      Name: !Sub ${ResourcePrefix}-github-connection-arn    # Export name
