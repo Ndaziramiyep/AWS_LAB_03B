@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: "2010-09-09"                     # CloudFormation template format version
+Description: >-                                             # Shown in the CloudFormation console
+  Onward Logistics - 01 foundation. GitHub OIDC provider, the GitHub Actions role (ECR push
+  only, trusted for the app repo main branch only), and the private ECR repository.
+  No IAM users, no access keys, no inline policies.
+
+Parameters:                                                 # Inputs supplied by the GitSync deployment file
+  ResourcePrefix:                                           # Company naming prefix
+    Type: String                                            # Text
+    Default: onward-orders-lab                              # <project>-<environment>
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"                # Lowercase, short, DNS-safe
+    Description: Naming prefix <project>-<environment> applied to every resource.
+  GitHubOrg:                                                # Owner of the app repo
+    Type: String                                            # Text
+    Default: Ndaziramiyep                                   # GitHub account
+    Description: GitHub user or organisation that owns the application repository.
+  AppRepo:                                                  # App repo name
+    Type: String                                            # Text
+    Default: onward-orders-app                              # Repo that builds images
+    Description: Name of the application repository (the only repo allowed to push images).
+  AppBranch:                                                # Branch allowed to push
+    Type: String                                            # Text
+    Default: main                                           # Only merged code ships
+    Description: Only workflows running on this branch can assume the role.
+  ExistingOidcProviderArn:                                  # Reuse an existing provider if present
+    Type: String                                            # Text
+    Default: ""                                             # Empty = create one
+    Description: >-
+      Leave empty to create the GitHub OIDC provider. An account can hold only one provider per
+      URL, so if one already exists, paste its ARN here and it will be reused.
+  ShaImagesToKeep:                                          # Rollback history depth
+    Type: Number                                            # Integer
+    Default: 20                                             # Last 20 releases kept
+    MinValue: 5                                             # Never fewer than 5
+    Description: Number of git-SHA tagged images kept in ECR for rollback.
+
+Conditions:                                                 # Switches
+  CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, ""]  # True = create the provider
+
+Resources:                                                  # Everything this stack creates
+  GitHubOidcProvider:                                       # Lets AWS trust GitHub-issued tokens
+    Type: AWS::IAM::OIDCProvider                            # IAM identity provider
+    Condition: CreateOidcProvider                           # Skip if one already exists
+    Properties:                                             # Provider settings
+      Url: https://token.actions.githubusercontent.com      # GitHub's token issuer
+      ClientIdList:                                         # Accepted audiences
+        - sts.amazonaws.com                                 # Audience used by configure-aws-credentials
+      ThumbprintList:                                       # Kept for older tooling; IAM trusts GitHub's CA
+        - 6938fd4d98bab03faadb97b34396831e3780aea1          # GitHub thumbprint 1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd          # GitHub thumbprint 2
+      Tags:                                                 # Resource tags
+        - Key: Name                                         # Name tag
+          Value: !Sub ${ResourcePrefix}-github-oidc         # Name value
+
+  EcrRepository:                                            # Private image registry
+    Type: AWS::ECR::Repository                              # ECR repo
+    Properties:                                             # Repo settings
+      RepositoryName: !Ref ResourcePrefix                   # Repo name = prefix
+      EmptyOnDelete: true                                   # Teardown can delete it with images inside
+      ImageScanningConfiguration:                           # Vulnerability scanning
+        ScanOnPush: true                                    # Scan every pushed image
+      EncryptionConfiguration:                              # Encryption at rest
+        EncryptionType: AES256                              # AWS-managed keys
+      ImageTagMutability: IMMUTABLE_WITH_EXCLUSION          # SHA tags can never be overwritten
+      ImageTagMutabilityExclusionFilters:                   # Tags allowed to move
+        - ImageTagMutabilityExclusionFilterType: WILDCARD   # Pattern match
+          ImageTagMutabilityExclusionFilterValue: latest    # Only "latest" moves (pipeline watches it)
+      LifecyclePolicy:                                      # Automatic clean-up rules
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the last ${ShaImagesToKeep} images for rollback",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": ${ShaImagesToKeep} },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:                                                 # Resource tags
+        - Key: Name                                         # Name tag
+          Value: !Ref ResourcePrefix                        # Name value
+
+  EcrPushPolicy:                                            # Exactly what CI needs, nothing more
+    Type: AWS::IAM::ManagedPolicy                           # Customer-managed, never inline
+    Properties:                                             # Policy settings
+      ManagedPolicyName: !Sub ${ResourcePrefix}-github-ecr-push-policy  # Policy name
+      Description: Push images to the Onward Orders ECR repository only.
+      PolicyDocument:                                       # The permissions
+        Version: "2012-10-17"                               # IAM policy language version
+        Statement:                                          # Statements
+          - Sid: EcrLogin                                   # docker login to ECR
+            Effect: Allow                                   # Grant
+            Action: ecr:GetAuthorizationToken               # Get a registry token
+            Resource: "*"                                   # This action has no resource-level control
+          - Sid: PushToThisRepositoryOnly                   # Push into one repo only
+            Effect: Allow                                   # Grant
+            Action:                                         # Image upload actions
+              - ecr:BatchCheckLayerAvailability             # Skip layers already uploaded
+              - ecr:InitiateLayerUpload                     # Start a layer upload
+              - ecr:UploadLayerPart                         # Upload layer chunks
+              - ecr:CompleteLayerUpload                     # Finish a layer upload
+              - ecr:PutImage                                # Write the manifest + tag
+              - ecr:BatchGetImage                           # Read manifests (re-tagging)
+              - ecr:DescribeImages                          # Check an image exists
+            Resource: !GetAtt EcrRepository.Arn             # This repository only
+
+  GitHubActionsRole:                                        # Role GitHub Actions assumes via OIDC
+    Type: AWS::IAM::Role                                    # IAM role
+    Properties:                                             # Role settings
+      RoleName: !Sub ${ResourcePrefix}-github-actions-role  # Fixed name used in the workflow file
+      Description: Assumed by GitHub Actions via OIDC (temporary credentials only) to push images.
+      MaxSessionDuration: 3600                              # Credentials expire after 1 hour max
+      AssumeRolePolicyDocument:                             # Trust policy, not an inline permissions policy
+        Version: "2012-10-17"                               # IAM policy language version
+        Statement:                                          # Trust statements
+          - Effect: Allow                                   # Allow assume
+            Principal:                                      # Who
+              Federated: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]  # GitHub OIDC
+            Action: sts:AssumeRoleWithWebIdentity           # Swap GitHub token for AWS creds
+            Condition:                                      # Narrow who may assume
+              StringEquals:                                 # Exact match
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com  # Token meant for AWS
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${AppRepo}:ref:refs/heads/${AppBranch}  # This repo + branch only
+      ManagedPolicyArns:                                    # Managed policies (no inline "Policies:")
+        - !Ref EcrPushPolicy                                # ECR push only
+      Tags:                                                 # Resource tags
+        - Key: Name                                         # Name tag
+          Value: !Sub ${ResourcePrefix}-github-actions-role # Name value
+
+Outputs:                                                    # Values other stacks need
+  EcrRepositoryName:                                        # Repo name
+    Value: !Ref EcrRepository                               # e.g. onward-orders-lab
+    Export:                                                 # Cross-stack export
+      Name: !Sub ${ResourcePrefix}-ecr-repo-name            # Export name
+  EcrRepositoryArn:                                         # Repo ARN
+    Value: !GetAtt EcrRepository.Arn                        # ARN value
+    Export:                                                 # Cross-stack export
+      Name: !Sub ${ResourcePrefix}-ecr-repo-arn             # Export name
+  EcrRepositoryUri:                                         # Repo URI for docker
+    Value: !GetAtt EcrRepository.RepositoryUri              # <acct>.dkr.ecr.<region>.amazonaws.com/<repo>
+    Export:                                                 # Cross-stack export
+      Name: !Sub ${ResourcePrefix}-ecr-repo-uri             # Export name
+  GitHubActionsRoleArn:                                     # Role ARN for the workflow
+    Description: Paste into the app repo workflow (role-to-assume). Not a secret.
+    Value: !GetAtt GitHubActionsRole.Arn                    # ARN value
+    Export:                                                 # Cross-stack export
+      Name: !Sub ${ResourcePrefix}-github-actions-role-arn  # Export name
