@@ -1,0 +1,52 @@
+<!doctype html>                                                  <!-- HTML5 document -->
+<html lang="en">                                                 <!-- Page language -->
+<head>                                                           <!-- Metadata -->
+  <meta charset="utf-8">                                         <!-- Text encoding -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">  <!-- Mobile friendly -->
+  <title>Onward Logistics Orders</title>                         <!-- Browser tab title -->
+  <style>                                                        /* Inline styles, no external calls */
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #1d2733; }  /* Base look */
+    header { background: #0b3d5c; color: #fff; padding: 20px 24px; }  /* Top banner */
+    main { max-width: 760px; margin: 24px auto; padding: 0 16px; }    /* Centered content */
+    .card { background: #fff; border-radius: 8px; padding: 18px 20px; margin-bottom: 16px; box-shadow: 0 1px 3px #0002; }  /* Panels */
+    .meta span { display: inline-block; margin: 4px 12px 4px 0; font-size: 14px; }  /* Version chips */
+    code { background: #eef2f5; padding: 2px 6px; border-radius: 4px; }  /* Inline code */
+    table { width: 100%; border-collapse: collapse; }            /* Order table */
+    td, th { text-align: left; padding: 6px 4px; border-bottom: 1px solid #e3e8ec; }  /* Table cells */
+    input, button { padding: 8px; font-size: 15px; }             /* Form controls */
+  </style>
+</head>
+<body>                                                           <!-- Visible page -->
+  <header>                                                       <!-- Banner -->
+    <h1>Onward Logistics Order System</h1>                       <!-- App name -->
+    <p>{{ student }}, Lab: {{ lab }}</p>                         <!-- Full name + lab name (requirement) -->
+  </header>
+  <main>                                                         <!-- Content -->
+    <section class="card meta">                                  <!-- Release info, makes blue/green visible -->
+      <span>Version <code>{{ version }}</code></span>            <!-- Git SHA -->
+      <span>Task <code>{{ task_id }}</code></span>               <!-- Which task answered -->
+      <span>AZ <code>{{ az }}</code></span>                      <!-- Which AZ it runs in -->
+      <span>Release note: {{ note }}</span>                      <!-- Human-readable change -->
+    </section>
+    <section class="card">                                       <!-- Order form -->
+      <h2>Place an order</h2>                                    <!-- Heading -->
+      <form method="post" action="/orders">                      <!-- Posts to /orders -->
+        <input name="item" placeholder="Item" required maxlength="60">  <!-- Item name -->
+        <input name="quantity" type="number" min="1" max="1000" value="1">  <!-- Quantity -->
+        <button type="submit">Submit</button>                    <!-- Send -->
+      </form>
+    </section>
+    <section class="card">                                       <!-- Recent orders -->
+      <h2>Recent orders (this task)</h2>                         <!-- Heading -->
+      <table>                                                    <!-- Orders table -->
+        <tr><th>#</th><th>Item</th><th>Qty</th><th>Time</th><th>Task</th></tr>  <!-- Header row -->
+        {% for o in orders %}                                    {# One row per order #}
+        <tr><td>{{ o.id }}</td><td>{{ o.item }}</td><td>{{ o.quantity }}</td><td>{{ o.created }}</td><td>{{ o.task }}</td></tr>  <!-- Order row -->
+        {% else %}                                               {# No orders yet #}
+        <tr><td colspan="5">No orders yet.</td></tr>             <!-- Empty state -->
+        {% endfor %}                                             {# End loop #}
+      </table>
+    </section>
+  </main>
+</body>
+</html>
