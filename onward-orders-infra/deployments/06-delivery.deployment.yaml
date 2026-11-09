@@ -1,0 +1,17 @@
+# GitSync deployment file for stack onward-orders-lab-06-delivery
+template-file-path: templates/06-delivery.yaml     # Template this stack deploys
+parameters:                             # Parameter values for the stack
+  ResourcePrefix: onward-orders-lab     # Naming prefix
+  ConnectionArn: arn:aws:codeconnections:eu-west-1:648637468459:connection/387b1181-82b8-4718-b249-b81bfe30c3c0  # GitHub connection (bootstrap output)
+  GitHubOrg: Ndaziramiyep               # App repo owner
+  AppRepo: onward-orders-app            # App repo with appspec.yaml + taskdef.json
+  AppBranch: main                       # Branch read by the pipeline
+  DeploymentConfigName: CodeDeployDefault.ECSCanary10Percent5Minutes  # Canary traffic shift
+  BlueTerminationWaitMinutes: "5"       # Rollback window
+tags:                                   # Company-standard tags, applied by GitSync to the stack and propagated to every taggable resource
+  Project: onward-orders                # Product / workload name
+  Environment: lab                      # Environment (lab, dev, prod)
+  Owner: patrick-ndaziramiye            # Accountable engineer
+  CostCenter: amalitech-training        # Billing owner
+  ManagedBy: cloudformation-gitsync     # How the resource is managed
+  Repository: onward-orders-infra       # Source repository

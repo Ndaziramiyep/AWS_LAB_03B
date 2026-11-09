@@ -1,0 +1,15 @@
+# GitSync deployment file for stack onward-orders-lab-05-autoscaling
+template-file-path: templates/05-autoscaling.yaml  # Template this stack deploys
+parameters:                             # Parameter values for the stack
+  ResourcePrefix: onward-orders-lab     # Naming prefix
+  MinCapacity: "2"                      # Set "0" (and MaxCapacity "0") to idle the service
+  MaxCapacity: "6"                      # Cost ceiling
+  CpuTargetPercent: "55"                # Target average CPU
+  EnableOfficeHoursSchedule: "false"    # "true" = scale to zero overnight on weekdays
+tags:                                   # Company-standard tags, applied by GitSync to the stack and propagated to every taggable resource
+  Project: onward-orders                # Product / workload name
+  Environment: lab                      # Environment (lab, dev, prod)
+  Owner: patrick-ndaziramiye            # Accountable engineer
+  CostCenter: amalitech-training        # Billing owner
+  ManagedBy: cloudformation-gitsync     # How the resource is managed
+  Repository: onward-orders-infra       # Source repository
