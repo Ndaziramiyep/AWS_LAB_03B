@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: "2010-09-09"                     # CloudFormation template format version
+Description: >-                                             # Shown in the CloudFormation console
+  Onward Logistics - 03 load balancer. The only public resource: an internet-facing ALB in the
+  public subnets with a production listener (blue) and a test listener (green) used by
+  CodeDeploy blue/green. Target groups use target type ip (required for Fargate awsvpc).
+
+Parameters:                                                 # Inputs
+  ResourcePrefix:                                           # Company naming prefix
+    Type: String                                            # Text
+    Default: onward-orders-lab                              # <project>-<environment>
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"                # Lowercase, short, DNS-safe
+    Description: Naming prefix <project>-<environment> applied to every resource.
+  CertificateArn:                                           # Optional TLS certificate
+    Type: String                                            # Text
+    Default: ""                                             # Empty = HTTP only (no domain in the lab)
+    Description: Optional ACM certificate. If set, production runs on 443 and port 80 redirects to it.
+  TestListenerPort:                                         # Port of the green preview listener
+    Type: Number                                            # Integer
+    Default: 8080                                           # Test port
+  AppPort:                                                  # Container port
+    Type: Number                                            # Integer
+    Default: 8080                                           # App listens here
+  HealthCheckPath:                                          # Health URL
+    Type: String                                            # Text
+    Default: /health                                        # Returns 200 when healthy
+
+Conditions:                                                 # Switches
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]  # True when HTTPS is configured
+
+Resources:                                                  # Everything this stack creates
+  LoadBalancer:                                             # The single public entry point
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer         # ALB resource
+    Properties:                                             # ALB settings
+      Name: !Sub ${ResourcePrefix}-alb                      # ALB name
+      Type: application                                     # Layer-7 load balancer
+      Scheme: internet-facing                               # Reachable from the internet
+      IpAddressType: ipv4                                   # IPv4 only
+      Subnets: !Split [",", !ImportValue { "Fn::Sub": "${ResourcePrefix}-public-subnet-ids" }]  # Public subnets, 2 AZs
+      SecurityGroups:                                       # Firewall
+        - !ImportValue { "Fn::Sub": "${ResourcePrefix}-alb-sg-id" }  # ALB SG from network stack
+      LoadBalancerAttributes:                               # Extra settings
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }  # Drop malformed headers
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }  # Idle connection timeout
+        - { Key: deletion_protection.enabled, Value: "false" }  # Allow teardown when idle
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-alb" }  # Name tag
+
+  BlueTargetGroup:                                          # Target group A (initially production)
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup          # Target group resource
+    Properties:                                             # Settings
+      Name: !Sub ${ResourcePrefix}-tg-blue                  # Name
+      VpcId: !ImportValue { "Fn::Sub": "${ResourcePrefix}-vpc-id" }  # VPC
+      TargetType: ip                                        # Fargate tasks register by IP
+      Protocol: HTTP                                        # ALB -> task protocol
+      Port: !Ref AppPort                                    # Task port
+      HealthCheckProtocol: HTTP                             # Health check protocol
+      HealthCheckPath: !Ref HealthCheckPath                 # /health
+      HealthCheckIntervalSeconds: 10                        # Check every 10 s
+      HealthCheckTimeoutSeconds: 5                          # Fail if no reply in 5 s
+      HealthyThresholdCount: 2                              # 2 passes = healthy
+      UnhealthyThresholdCount: 2                            # 2 fails = unhealthy
+      Matcher: { HttpCode: "200" }                          # Only 200 counts as healthy
+      TargetGroupAttributes:                                # Extra settings
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }  # Faster drain on release
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-tg-blue" }  # Name tag
+
+  GreenTargetGroup:                                         # Target group B (receives each new release)
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup          # Target group resource
+    Properties:                                             # Settings
+      Name: !Sub ${ResourcePrefix}-tg-green                 # Name
+      VpcId: !ImportValue { "Fn::Sub": "${ResourcePrefix}-vpc-id" }  # VPC
+      TargetType: ip                                        # Fargate tasks register by IP
+      Protocol: HTTP                                        # ALB -> task protocol
+      Port: !Ref AppPort                                    # Task port
+      HealthCheckProtocol: HTTP                             # Health check protocol
+      HealthCheckPath: !Ref HealthCheckPath                 # /health
+      HealthCheckIntervalSeconds: 10                        # Check every 10 s
+      HealthCheckTimeoutSeconds: 5                          # Fail if no reply in 5 s
+      HealthyThresholdCount: 2                              # 2 passes = healthy
+      UnhealthyThresholdCount: 2                            # 2 fails = unhealthy
+      Matcher: { HttpCode: "200" }                          # Only 200 counts as healthy
+      TargetGroupAttributes:                                # Extra settings
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }  # Faster drain on release
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-tg-green" }  # Name tag
+
+  ProductionListener:                                       # Customer traffic. CodeDeploy owns its target after release 1 - do not edit.
+    Type: AWS::ElasticLoadBalancingV2::Listener             # Listener resource
+    Properties:                                             # Settings
+      LoadBalancerArn: !Ref LoadBalancer                    # On this ALB
+      Port: !If [HasCertificate, 443, 80]                   # 443 with a cert, else 80
+      Protocol: !If [HasCertificate, HTTPS, HTTP]           # HTTPS with a cert, else HTTP
+      SslPolicy: !If [HasCertificate, ELBSecurityPolicy-TLS13-1-2-2021-06, !Ref AWS::NoValue]  # Modern TLS only
+      Certificates: !If [HasCertificate, [{ CertificateArn: !Ref CertificateArn }], !Ref AWS::NoValue]  # Cert if provided
+      DefaultActions:                                       # What the listener does
+        - Type: forward                                     # Send traffic
+          TargetGroupArn: !Ref BlueTargetGroup              # To blue at creation time
+
+  HttpRedirectListener:                                     # Redirect HTTP to HTTPS (only with a cert)
+    Type: AWS::ElasticLoadBalancingV2::Listener             # Listener resource
+    Condition: HasCertificate                               # Only when HTTPS is on
+    Properties:                                             # Settings
+      LoadBalancerArn: !Ref LoadBalancer                    # On this ALB
+      Port: 80                                              # HTTP
+      Protocol: HTTP                                        # HTTP
+      DefaultActions:                                       # What the listener does
+        - Type: redirect                                    # Redirect
+          RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }  # Permanent redirect to HTTPS
+
+  TestListener:                                             # Preview listener used by CodeDeploy for the new version
+    Type: AWS::ElasticLoadBalancingV2::Listener             # Listener resource
+    Properties:                                             # Settings
+      LoadBalancerArn: !Ref LoadBalancer                    # On this ALB
+      Port: !Ref TestListenerPort                           # 8080
+      Protocol: HTTP                                        # HTTP
+      DefaultActions:                                       # What the listener does
+        - Type: forward                                     # Send traffic
+          TargetGroupArn: !Ref GreenTargetGroup             # To green at creation time
+
+Outputs:                                                    # Values other stacks import
+  LoadBalancerDnsName:                                      # Public URL
+    Description: Open this in a browser.
+    Value: !GetAtt LoadBalancer.DNSName                     # ALB DNS name
+    Export: { Name: !Sub "${ResourcePrefix}-alb-dns" }      # Export name
+  LoadBalancerFullName:                                     # For CloudWatch alarm dimensions
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName        # app/<name>/<id>
+    Export: { Name: !Sub "${ResourcePrefix}-alb-full-name" }  # Export name
+  ProductionListenerArn:                                    # For CodeDeploy
+    Value: !Ref ProductionListener                          # Listener ARN
+    Export: { Name: !Sub "${ResourcePrefix}-prod-listener-arn" }  # Export name
+  TestListenerArn:                                          # For CodeDeploy
+    Value: !Ref TestListener                                # Listener ARN
+    Export: { Name: !Sub "${ResourcePrefix}-test-listener-arn" }  # Export name
+  BlueTargetGroupArn:                                       # For the ECS service
+    Value: !Ref BlueTargetGroup                             # Target group ARN
+    Export: { Name: !Sub "${ResourcePrefix}-tg-blue-arn" }  # Export name
+  BlueTargetGroupName:                                      # For CodeDeploy
+    Value: !GetAtt BlueTargetGroup.TargetGroupName          # Short name
+    Export: { Name: !Sub "${ResourcePrefix}-tg-blue-name" } # Export name
+  BlueTargetGroupFullName:                                  # For alarms
+    Value: !GetAtt BlueTargetGroup.TargetGroupFullName      # targetgroup/<name>/<id>
+    Export: { Name: !Sub "${ResourcePrefix}-tg-blue-full-name" }  # Export name
+  GreenTargetGroupName:                                     # For CodeDeploy
+    Value: !GetAtt GreenTargetGroup.TargetGroupName         # Short name
+    Export: { Name: !Sub "${ResourcePrefix}-tg-green-name" }  # Export name
+  GreenTargetGroupFullName:                                 # For alarms
+    Value: !GetAtt GreenTargetGroup.TargetGroupFullName     # targetgroup/<name>/<id>
+    Export: { Name: !Sub "${ResourcePrefix}-tg-green-full-name" }  # Export name
