@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"                     # CloudFormation template format version
+Description: >-                                             # Shown in the CloudFormation console
+  Onward Logistics - 04 ECS. Fargate cluster, log group, task execution and task roles
+  (managed policies only), the BOOTSTRAP task definition, and the ECS service controlled by
+  CodeDeploy (blue/green). Tasks run in private subnets with no public IP.
+
+Parameters:                                                 # Inputs
+  ResourcePrefix:                                           # Company naming prefix
+    Type: String                                            # Text
+    Default: onward-orders-lab                              # <project>-<environment>
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"                # Lowercase, short, DNS-safe
+    Description: Naming prefix <project>-<environment> applied to every resource.
+  TaskCpu:                                                  # CPU per task
+    Type: String                                            # Text (ECS expects a string)
+    Default: "256"                                          # 0.25 vCPU
+    AllowedValues: ["256", "512", "1024"]                   # Allowed sizes
+    Description: 0.25 vCPU is enough for a 2-worker gunicorn app; scaling is horizontal, not vertical.
+  TaskMemory:                                               # Memory per task
+    Type: String                                            # Text (ECS expects a string)
+    Default: "512"                                          # 512 MiB
+    AllowedValues: ["512", "1024", "2048"]                  # Allowed sizes
+    Description: Flask + gunicorn uses well under 200 MiB; 512 MiB is the smallest valid size for 0.25 vCPU.
+  AppPort:                                                  # Container port
+    Type: Number                                            # Integer
+    Default: 8080                                           # App listens here
+  BootstrapImageTag:                                        # Image for the very first start
+    Type: String                                            # Text
+    Default: latest                                         # Must already exist in ECR
+    Description: Image used only for the first deployment. Later versions are released by CodeDeploy.
+  DesiredCount:                                             # Starting task count
+    Type: Number                                            # Integer
+    Default: 2                                              # One per AZ
+    MinValue: 0                                             # 0 allowed for idle environments
+    Description: Initial task count. Auto scaling (05) owns the count after creation. Minimum 2 for HA.
+  HealthCheckGracePeriod:                                   # Startup time before health checks count
+    Type: Number                                            # Seconds
+    Default: 60                                             # 1 minute
+  LogRetentionDays:                                         # How long logs are kept
+    Type: Number                                            # Days
+    Default: 14                                             # 2 weeks
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]             # Valid CloudWatch values
+
+Resources:                                                  # Everything this stack creates
+  Cluster:                                                  # Logical group for the service
+    Type: AWS::ECS::Cluster                                 # ECS cluster
+    Properties:                                             # Cluster settings
+      ClusterName: !Sub ${ResourcePrefix}-cluster           # Cluster name
+      ClusterSettings:                                      # Extra settings
+        - Name: containerInsights                           # Detailed CPU/memory metrics
+          Value: enabled                                    # Turned on
+      CapacityProviders: [FARGATE]                          # Serverless capacity only
+      DefaultCapacityProviderStrategy:                      # Default placement
+        - CapacityProvider: FARGATE                         # On-demand Fargate
+          Weight: 1                                         # All tasks
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-cluster" }  # Name tag
+
+  LogGroup:                                                 # Where container logs go
+    Type: AWS::Logs::LogGroup                               # CloudWatch log group
+    Properties:                                             # Settings
+      LogGroupName: !Sub /ecs/${ResourcePrefix}             # Log group name
+      RetentionInDays: !Ref LogRetentionDays                # Auto-delete old logs (cost)
+
+  TaskExecutionRole:                                        # Used by ECS to pull images and ship logs
+    Type: AWS::IAM::Role                                    # IAM role
+    Properties:                                             # Role settings
+      RoleName: !Sub ${ResourcePrefix}-task-exec-role       # Fixed name (referenced in taskdef.json)
+      Description: ECS agent role - pull from ECR and write to CloudWatch Logs.
+      AssumeRolePolicyDocument:                             # Trust policy
+        Version: "2012-10-17"                               # Policy language version
+        Statement:                                          # Statements
+          - Effect: Allow                                   # Allow assume
+            Principal: { Service: ecs-tasks.amazonaws.com } # ECS tasks service
+            Action: sts:AssumeRole                          # Assume the role
+            Condition:                                      # Confused-deputy protection
+              StringEquals:                                 # Exact match
+                aws:SourceAccount: !Ref AWS::AccountId      # This account only
+      ManagedPolicyArns:                                    # Managed policies only
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy  # AWS-managed ECR pull + logs
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-task-exec-role" }  # Name tag
+
+  TaskRolePolicy:                                           # Permissions for the app code itself
+    Type: AWS::IAM::ManagedPolicy                           # Customer-managed, never inline
+    Properties:                                             # Policy settings
+      ManagedPolicyName: !Sub ${ResourcePrefix}-task-role-policy  # Policy name
+      Description: Least privilege for the order app container (currently no AWS API access).
+      PolicyDocument:                                       # The permissions
+        Version: "2012-10-17"                               # Policy language version
+        Statement:                                          # Statements (add Allow here if the app needs AWS later)
+          - Sid: DenyPrivilegeEscalation                    # Guard rail
+            Effect: Deny                                    # Explicit deny
+            Action:                                         # Dangerous actions
+              - iam:*                                       # No IAM changes
+              - sts:AssumeRole                              # No role hopping
+              - organizations:*                             # No org changes
+            Resource: "*"                                   # Everywhere
+
+  TaskRole:                                                 # Identity of the running app
+    Type: AWS::IAM::Role                                    # IAM role
+    Properties:                                             # Role settings
+      RoleName: !Sub ${ResourcePrefix}-task-role            # Fixed name (referenced in taskdef.json)
+      Description: Application role for the order system containers.
+      AssumeRolePolicyDocument:                             # Trust policy
+        Version: "2012-10-17"                               # Policy language version
+        Statement:                                          # Statements
+          - Effect: Allow                                   # Allow assume
+            Principal: { Service: ecs-tasks.amazonaws.com } # ECS tasks service
+            Action: sts:AssumeRole                          # Assume the role
+            Condition:                                      # Confused-deputy protection
+              StringEquals:                                 # Exact match
+                aws:SourceAccount: !Ref AWS::AccountId      # This account only
+      ManagedPolicyArns:                                    # Managed policies only
+        - !Ref TaskRolePolicy                               # Least-privilege policy above
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-task-role" }  # Name tag
+
+  TaskDefinition:                                           # BOOTSTRAP version only - CodeDeploy owns later revisions, do not edit
+    Type: AWS::ECS::TaskDefinition                          # Task definition
+    Properties:                                             # Settings
+      Family: !Ref ResourcePrefix                           # Same family as app repo taskdef.json
+      RequiresCompatibilities: [FARGATE]                    # Runs on Fargate
+      NetworkMode: awsvpc                                   # Each task gets its own ENI (needed for ip targets)
+      Cpu: !Ref TaskCpu                                     # CPU size
+      Memory: !Ref TaskMemory                               # Memory size
+      RuntimePlatform:                                      # OS/arch
+        OperatingSystemFamily: LINUX                        # Linux
+        CpuArchitecture: X86_64                             # Matches GitHub-hosted runner builds
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn       # Pull + logs role
+      TaskRoleArn: !GetAtt TaskRole.Arn                     # App role
+      ContainerDefinitions:                                 # Containers in the task
+        - Name: app                                         # Container name (used by appspec)
+          Image: !Sub                                       # Image URI
+            - "${RepoUri}:${BootstrapImageTag}"             # <repo>:latest
+            - RepoUri: !ImportValue { "Fn::Sub": "${ResourcePrefix}-ecr-repo-uri" }  # Repo from foundation stack
+          Essential: true                                   # Task stops if this container stops
+          PortMappings:                                     # Exposed ports
+            - ContainerPort: !Ref AppPort                   # 8080
+              Protocol: tcp                                 # TCP
+          LogConfiguration:                                 # Logging
+            LogDriver: awslogs                              # Send stdout to CloudWatch
+            Options:                                        # Driver options
+              awslogs-group: !Ref LogGroup                  # Log group
+              awslogs-region: !Ref AWS::Region              # Region
+              awslogs-stream-prefix: app                    # Stream prefix
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Ref ResourcePrefix }         # Name tag
+
+  Service:                                                  # Keeps N tasks running behind the ALB
+    Type: AWS::ECS::Service                                 # ECS service
+    Properties:                                             # Service settings
+      ServiceName: !Sub ${ResourcePrefix}-service           # Service name
+      Cluster: !Ref Cluster                                 # In this cluster
+      TaskDefinition: !Ref TaskDefinition                   # Bootstrap revision
+      LaunchType: FARGATE                                   # Serverless
+      PlatformVersion: LATEST                               # Latest Fargate platform
+      DesiredCount: !Ref DesiredCount                       # Starting count
+      DeploymentController:                                 # Who performs releases
+        Type: CODE_DEPLOY                                   # CodeDeploy blue/green
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriod  # Startup grace
+      EnableECSManagedTags: true                            # Adds cluster/service tags to tasks
+      PropagateTags: SERVICE                                # Copy service tags to tasks
+      NetworkConfiguration:                                 # Networking
+        AwsvpcConfiguration:                                # awsvpc settings
+          AssignPublicIp: DISABLED                          # No public IP on tasks
+          Subnets: !Split [",", !ImportValue { "Fn::Sub": "${ResourcePrefix}-private-subnet-ids" }]  # Private subnets, 2 AZs
+          SecurityGroups:                                   # Firewall
+            - !ImportValue { "Fn::Sub": "${ResourcePrefix}-task-sg-id" }  # Task SG
+      LoadBalancers:                                        # ALB registration
+        - ContainerName: app                                # Container to register
+          ContainerPort: !Ref AppPort                       # Its port
+          TargetGroupArn: !ImportValue { "Fn::Sub": "${ResourcePrefix}-tg-blue-arn" }  # Start in blue
+      Tags:                                                 # Resource tags
+        - { Key: Name, Value: !Sub "${ResourcePrefix}-service" }  # Name tag
+
+Outputs:                                                    # Values other stacks import
+  ClusterName:                                              # Cluster name
+    Value: !Ref Cluster                                     # Value
+    Export: { Name: !Sub "${ResourcePrefix}-cluster-name" } # Export name
+  ServiceName:                                              # Service name
+    Value: !GetAtt Service.Name                             # Value
+    Export: { Name: !Sub "${ResourcePrefix}-service-name" } # Export name
+  TaskExecutionRoleArn:                                     # Exec role ARN
+    Value: !GetAtt TaskExecutionRole.Arn                    # Value
+    Export: { Name: !Sub "${ResourcePrefix}-task-exec-role-arn" }  # Export name
+  TaskRoleArn:                                              # Task role ARN
+    Value: !GetAtt TaskRole.Arn                             # Value
+    Export: { Name: !Sub "${ResourcePrefix}-task-role-arn" }  # Export name
+  LogGroupName:                                             # Log group name
+    Value: !Ref LogGroup                                    # Value
+    Export: { Name: !Sub "${ResourcePrefix}-log-group" }    # Export name
