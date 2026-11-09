@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: "2010-09-09"                     # CloudFormation template format version
+Description: >-                                             # Shown in the CloudFormation console
+  Onward Logistics - 05 auto scaling. Target tracking on CPU and memory keeps the order service
+  between MinCapacity and MaxCapacity with no manual action. Optional office-hours schedule
+  scales to zero overnight (Finance: idle environments should not cost money).
+
+Parameters:                                                 # Inputs
+  ResourcePrefix:                                           # Company naming prefix
+    Type: String                                            # Text
+    Default: onward-orders-lab                              # <project>-<environment>
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"                # Lowercase, short, DNS-safe
+    Description: Naming prefix <project>-<environment> applied to every resource.
+  MinCapacity:                                              # Fewest tasks allowed
+    Type: Number                                            # Integer
+    Default: 2                                              # One per AZ (survives task or AZ loss)
+    MinValue: 0                                             # 0 = idle environment
+    Description: 2 = one task per AZ, survives a task or AZ failure. Set 0 (and MaxCapacity 0) to idle.
+  MaxCapacity:                                              # Most tasks allowed
+    Type: Number                                            # Integer
+    Default: 6                                              # Cost ceiling
+    MinValue: 0                                             # 0 = idle environment
+  CpuTargetPercent:                                         # Desired average CPU
+    Type: Number                                            # Percent
+    Default: 55                                             # Leaves headroom for spikes
+    MinValue: 20                                            # Lower bound
+    MaxValue: 90                                            # Upper bound
+  MemoryTargetPercent:                                      # Desired average memory
+    Type: Number                                            # Percent
+    Default: 75                                             # Memory target
+    MinValue: 20                                            # Lower bound
+    MaxValue: 90                                            # Upper bound
+  ScaleOutCooldown:                                         # Wait after adding tasks
+    Type: Number                                            # Seconds
+    Default: 60                                             # React fast to peak load
+    Description: Short - react quickly to peak-day load.
+  ScaleInCooldown:                                          # Wait after removing tasks
+    Type: Number                                            # Seconds
+    Default: 300                                            # Slow down to avoid flapping
+    Description: Longer than scale-out to avoid flapping.
+  EnableOfficeHoursSchedule:                                # Turn nightly scale-to-zero on/off
+    Type: String                                            # Text
+    Default: "false"                                        # Off by default
+    AllowedValues: ["true", "false"]                        # Boolean as text
+    Description: If true, scale to 0 at 19:00 and back to MinCapacity at 07:00 (Mon-Fri, UTC).
+
+Conditions:                                                 # Switches
+  UseSchedule: !Equals [!Ref EnableOfficeHoursSchedule, "true"]  # True = add schedules
+
+Resources:                                                  # Everything this stack creates
+  ScalableTarget:                                           # Registers the ECS service with auto scaling
+    Type: AWS::ApplicationAutoScaling::ScalableTarget       # Scalable target resource
+    Properties:                                             # Settings
+      ServiceNamespace: ecs                                 # ECS
+      ScalableDimension: ecs:service:DesiredCount           # Scale the task count
+      ResourceId: !Sub                                      # Which service
+        - service/${Cluster}/${Service}                     # Format: service/<cluster>/<service>
+        - Cluster: !ImportValue { "Fn::Sub": "${ResourcePrefix}-cluster-name" }  # From ECS stack
+          Service: !ImportValue { "Fn::Sub": "${ResourcePrefix}-service-name" }  # From ECS stack
+      MinCapacity: !Ref MinCapacity                         # Floor
+      MaxCapacity: !Ref MaxCapacity                         # Ceiling
+      RoleARN: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService  # AWS service-linked role
+      ScheduledActions: !If                                 # Optional office-hours schedule
+        - UseSchedule                                       # Only if enabled
+        - - ScheduledActionName: !Sub ${ResourcePrefix}-evening-scale-to-zero  # Evening action
+            Schedule: cron(0 19 ? * MON-FRI *)              # 19:00 UTC weekdays
+            ScalableTargetAction: { MinCapacity: 0, MaxCapacity: 0 }  # Zero tasks overnight
+          - ScheduledActionName: !Sub ${ResourcePrefix}-morning-scale-up  # Morning action
+            Schedule: cron(0 7 ? * MON-FRI *)               # 07:00 UTC weekdays
+            ScalableTargetAction: { MinCapacity: !Ref MinCapacity, MaxCapacity: !Ref MaxCapacity }  # Back to normal
+        - !Ref AWS::NoValue                                 # Otherwise no schedule
+
+  CpuTargetTrackingPolicy:                                  # Scale on CPU
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy        # Scaling policy (not an IAM policy)
+    Properties:                                             # Settings
+      PolicyName: !Sub ${ResourcePrefix}-cpu-target-tracking  # Policy name
+      PolicyType: TargetTrackingScaling                     # Keep a metric near a target
+      ScalingTargetId: !Ref ScalableTarget                  # The ECS service
+      TargetTrackingScalingPolicyConfiguration:             # Target settings
+        PredefinedMetricSpecification:                      # Built-in metric
+          PredefinedMetricType: ECSServiceAverageCPUUtilization  # Average CPU of the service
+        TargetValue: !Ref CpuTargetPercent                  # Target percent
+        ScaleOutCooldown: !Ref ScaleOutCooldown             # Fast out
+        ScaleInCooldown: !Ref ScaleInCooldown               # Slow in
+
+  MemoryTargetTrackingPolicy:                               # Scale on memory
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy        # Scaling policy (not an IAM policy)
+    Properties:                                             # Settings
+      PolicyName: !Sub ${ResourcePrefix}-memory-target-tracking  # Policy name
+      PolicyType: TargetTrackingScaling                     # Keep a metric near a target
+      ScalingTargetId: !Ref ScalableTarget                  # The ECS service
+      TargetTrackingScalingPolicyConfiguration:             # Target settings
+        PredefinedMetricSpecification:                      # Built-in metric
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization  # Average memory of the service
+        TargetValue: !Ref MemoryTargetPercent               # Target percent
+        ScaleOutCooldown: !Ref ScaleOutCooldown             # Fast out
+        ScaleInCooldown: !Ref ScaleInCooldown               # Slow in
+
+  # ALBRequestCountPerTarget is not used: it is tied to ONE target group, and blue/green swaps
+  # the live group on every release, so that metric would go stale.
+
+Outputs:                                                    # Values for reference
+  ScalableTargetId:                                         # Scalable target ID
+    Value: !Ref ScalableTarget                              # Value
