@@ -1,0 +1,33 @@
+{
+  "family": "onward-orders-lab",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::648637468459:role/onward-orders-lab-task-exec-role",
+  "taskRoleArn": "arn:aws:iam::648637468459:role/onward-orders-lab-task-role",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "<IMAGE1_NAME>",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/onward-orders-lab",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "app"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "key": "Project", "value": "onward-orders" },
+    { "key": "Environment", "value": "lab" },
+    { "key": "Owner", "value": "patrick-ndaziramiye" },
+    { "key": "CostCenter", "value": "amalitech-training" },
+    { "key": "ManagedBy", "value": "codepipeline" }
+  ]
+}

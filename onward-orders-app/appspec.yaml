@@ -1,0 +1,11 @@
+# AppSpec read by CodeDeploy (via the pipeline's CodeDeployToECS action)
+version: 0.0                                               # AppSpec format version
+Resources:                                                 # What to deploy
+  - TargetService:                                         # The ECS service being updated
+      Type: AWS::ECS::Service                              # Resource type
+      Properties:                                          # Deployment properties
+        TaskDefinition: <TASK_DEFINITION>                  # Replaced by the pipeline with the new revision ARN
+        LoadBalancerInfo:                                  # Which container the ALB sends traffic to
+          ContainerName: "app"                             # Must match the name in taskdef.json
+          ContainerPort: 8080                              # Must match the container port
+        PlatformVersion: "LATEST"                          # Fargate platform version
