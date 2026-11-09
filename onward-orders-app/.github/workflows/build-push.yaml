@@ -1,0 +1,59 @@
+name: build-and-push                                       # Workflow name shown in GitHub
+
+on:                                                       # When it runs
+  push:                                                   # On push
+    branches: [main]                                      # Only merges to main ship
+  pull_request:                                           # PRs run tests only (no push, no AWS)
+
+permissions:                                              # Token permissions
+  id-token: write                                         # Required to request the OIDC token
+  contents: read                                          # Read the repo
+
+concurrency:                                              # One release build at a time
+  group: build-push-${{ github.ref }}                     # Per branch
+  cancel-in-progress: false                               # Never cancel a release mid-push
+
+env:                                                      # Shared values (not secrets)
+  AWS_REGION: eu-west-1                                   # Target region
+  ROLE_ARN: arn:aws:iam::648637468459:role/onward-orders-lab-github-actions-role  # Role from the foundation stack
+  ECR_REPOSITORY: onward-orders-lab                       # Repository name
+
+jobs:                                                     # Jobs
+  test:                                                   # Unit tests gate every build
+    runs-on: ubuntu-latest                                # GitHub-hosted runner
+    steps:                                                # Steps
+      - uses: actions/checkout@v4                         # Get the code
+      - uses: actions/setup-python@v5                     # Install Python
+        with:                                             # Options
+          python-version: "3.12"                          # Same version as the image
+      - run: pip install -r app/requirements.txt pytest   # Install deps + pytest
+      - run: pytest -q                                    # Run tests
+
+  build-push:                                             # Build and push the image
+    needs: test                                           # Only if tests pass
+    if: github.event_name == 'push'                       # Never from pull requests
+    runs-on: ubuntu-latest                                # GitHub-hosted runner
+    steps:                                                # Steps
+      - uses: actions/checkout@v4                         # Get the code
+
+      - name: Configure AWS credentials (OIDC, no stored keys)  # Temporary STS credentials
+        uses: aws-actions/configure-aws-credentials@v4    # Official AWS action
+        with:                                             # Options
+          role-to-assume: ${{ env.ROLE_ARN }}             # Role trusted for this repo + main only
+          aws-region: ${{ env.AWS_REGION }}               # Region
+          role-session-name: gha-${{ github.run_id }}     # Traceable session name in CloudTrail
+
+      - name: Log in to Amazon ECR                        # docker login with a short-lived token
+        id: ecr                                           # Step ID for outputs
+        uses: aws-actions/amazon-ecr-login@v2             # Official AWS action
+
+      - name: Build, tag and push                         # Build once, push two tags
+        env:                                              # Step variables
+          REGISTRY: ${{ steps.ecr.outputs.registry }}     # <account>.dkr.ecr.<region>.amazonaws.com
+        run: |
+          SHA="${GITHUB_SHA::7}"                          # Short commit SHA = version
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"               # Full repository URI
+          docker build --build-arg APP_VERSION="$SHA" -t "$IMAGE:$SHA" -t "$IMAGE:latest" .  # Build with both tags
+          docker push "$IMAGE:$SHA"                       # Immutable tag first (audit trail, rollback target)
+          docker push "$IMAGE:latest"                     # Moving tag last - this push triggers the release
+          echo "### Pushed \`$IMAGE:$SHA\`" >> "$GITHUB_STEP_SUMMARY"  # Show in the run summary
