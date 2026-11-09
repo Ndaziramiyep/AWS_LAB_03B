@@ -1,0 +1,36 @@
+name: lint-templates                                       # Workflow name shown in GitHub
+
+on:                                                       # When it runs
+  pull_request:                                           # On every pull request
+  push:                                                   # And on pushes
+    branches: [main]                                      # To main
+
+permissions:                                              # Token permissions
+  contents: read                                          # Read the repo only (no AWS access needed)
+
+jobs:                                                     # Jobs
+  validate:                                               # Single job
+    runs-on: ubuntu-latest                                # GitHub-hosted runner
+    steps:                                                # Steps
+      - uses: actions/checkout@v4                         # Get the code
+
+      - uses: actions/setup-python@v5                     # Install Python
+        with:                                             # Options
+          python-version: "3.12"                          # Python version
+
+      - name: cfn-lint                                    # CloudFormation linter
+        run: |                                            # Commands
+          pip install cfn-lint                            # Install it
+          cfn-lint --regions eu-west-1 -- bootstrap/*.yaml templates/*.yaml  # Lint every template
+
+      - name: No inline IAM policies                      # Company rule check
+        run: |                                            # Commands
+          if grep -RnE "^\s*Policies:|AWS::IAM::Policy\b" templates bootstrap; then  # Inline policy patterns
+            echo "Inline IAM policies are not allowed"; exit 1  # Fail the build
+          fi
+          echo "OK - managed policies only"               # Pass
+
+      - name: cfn-guard security rules                    # Policy-as-code checks
+        run: |                                            # Commands
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/aws-cloudformation/cloudformation-guard/main/install-guard.sh | sh  # Install cfn-guard
+          ~/.guard/bin/cfn-guard validate --data templates --rules rules  # Run our rules

@@ -1,0 +1,40 @@
+# cfn-guard rules for Onward Logistics company standards (run in .github/workflows/lint.yaml)
+
+let iam_roles = Resources.*[ Type == 'AWS::IAM::Role' ]          # Every IAM role in a template
+let iam_policies = Resources.*[ Type == 'AWS::IAM::Policy' ]     # Any inline-policy resource
+let services = Resources.*[ Type == 'AWS::ECS::Service' ]        # ECS services
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]          # Subnets
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]           # S3 buckets
+let nat_gateways = Resources.*[ Type == 'AWS::EC2::NatGateway' ] # NAT gateways
+let repos = Resources.*[ Type == 'AWS::ECR::Repository' ]        # ECR repositories
+
+rule no_inline_policy_resources {                                # AWS::IAM::Policy creates inline policies
+  %iam_policies empty                                            # Must not exist
+}
+
+rule roles_have_no_inline_policies when %iam_roles !empty {      # Roles use ManagedPolicyArns only
+  %iam_roles.Properties.Policies !exists                         # No "Policies:" block
+}
+
+rule no_nat_gateway {                                            # Security: no internet path for the app
+  %nat_gateways empty                                            # Must not exist
+}
+
+rule tasks_private when %services !empty {                       # Tasks never get public IPs
+  %services.Properties.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == 'DISABLED'  # Private only
+  %services.Properties.DeploymentController.Type == 'CODE_DEPLOY'  # Blue/green controller
+}
+
+rule subnets_no_auto_public_ip when %subnets !empty {            # No subnet hands out public IPs
+  %subnets.Properties.MapPublicIpOnLaunch == false               # Disabled everywhere
+}
+
+rule buckets_encrypted_and_private when %buckets !empty {        # S3 hardening
+  %buckets.Properties.BucketEncryption exists                    # Encryption on
+  %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true     # Block ACLs
+  %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true  # Block public policies
+}
+
+rule ecr_scan_on_push when %repos !empty {                       # Image scanning
+  %repos.Properties.ImageScanningConfiguration.ScanOnPush == true  # Scan every push
+}
